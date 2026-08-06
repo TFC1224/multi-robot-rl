@@ -1,0 +1,49 @@
+# MAPPO hyperparameters for the pure-CTDE multi-robot exploration system.
+# Mirrors 方案三 §6.4 mappo_config.yaml.
+
+training:
+  algorithm: MAPPO
+  total_timesteps: 1000000
+  n_steps: 2048
+  n_epochs: 10
+  batch_size: 64
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 0.5
+
+actor:
+  learning_rate: 3.0e-4
+  network: shared
+  n_actions: 16
+  map_size: 64
+
+critic:
+  learning_rate: 5.0e-4
+  network: centralized
+  use_global_state: true
+
+environment:
+  n_agents: 3
+  scenario: multi_1          # multi_1 | multi_2 | multi_3
+  map_resolution: 0.1       # meters per cell
+  target_coverage: 0.95
+  max_steps_per_episode: 300
+  step_cells: 5             # how many cells each action advances
+
+reward:
+  r_explore: 10.0
+  r_individual: 5.0
+  r_overlap: 3.0
+  r_balance: 0.5
+  r_collision: 50.0
+  r_step: 0.01
+  r_done: 150.0
+
+logging:
+  log_freq: 2048
+  save_freq: 50000
+  seed: 0
+  save_dir: models

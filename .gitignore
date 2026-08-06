@@ -1,0 +1,24 @@
+# Python / build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+
+# Trained model artifacts
+models/
+*.pth
+*.pt
+
+# ROS 2 build outputs (colcon)
+install/
+log/
+build/
