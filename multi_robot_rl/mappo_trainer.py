@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -45,6 +46,43 @@ class TrainConfig:
     target_coverage: float = 0.95
     max_steps_per_episode: int = 300
     device: str = 'auto'  # 'auto', 'cuda', 'cpu'
+
+    # Phase 4 additions
+    use_amp: bool = False
+    amp_dtype: str = 'bfloat16'
+    lr_schedule: str = 'none'  # 'none' | 'linear'
+
+    @classmethod
+    def from_configs(cls, configs: Dict[str, Any]) -> 'TrainConfig':
+        """Build a TrainConfig from the merged config dict."""
+        train = configs.get('train', {})
+        env = configs.get('env', {})
+        model = configs.get('model', {})
+        return cls(
+            scenario=env.get('scenario', train.get('scenario', 'multi_1')),
+            total_timesteps=train.get('total_timesteps', 1_000_000),
+            n_steps=train.get('n_steps', 2048),
+            n_epochs=train.get('n_epochs', 10),
+            batch_size=train.get('batch_size', 64),
+            gamma=train.get('gamma', 0.99),
+            gae_lambda=train.get('gae_lambda', 0.95),
+            clip_range=train.get('clip_range', 0.2),
+            actor_lr=train.get('actor_lr', 3e-4),
+            critic_lr=train.get('critic_lr', 5e-4),
+            entropy_coef=train.get('entropy_coef', 0.01),
+            value_loss_coef=train.get('value_loss_coef', 0.5),
+            max_grad_norm=train.get('max_grad_norm', 0.5),
+            save_freq=train.get('save_freq', 50_000),
+            log_freq=train.get('log_freq', 2_048),
+            seed=train.get('seed', 0),
+            save_dir=train.get('save_dir', 'models'),
+            target_coverage=env.get('target_coverage', train.get('target_coverage', 0.95)),
+            max_steps_per_episode=env.get('max_steps_per_episode', train.get('max_steps_per_episode', 300)),
+            device=train.get('device', 'auto'),
+            use_amp=train.get('amp', False),
+            amp_dtype=train.get('amp_dtype', 'bfloat16'),
+            lr_schedule=train.get('lr_schedule', 'none'),
+        )
 
 
 class MAPPOTrainer:

@@ -1,0 +1,31 @@
+{
+    "n_agents": 3,
+    "max_frontiers": 16,
+    "local_map_size": 64,
+    "map_resolution": 0.1,
+    "step_cells": 5,
+    "sensor_range_m": 4.0,
+    "collision_threshold_cells": 2,
+
+    "scenario": "multi_1",
+    "target_coverage": 0.95,
+    "max_steps_per_episode": 300,
+
+    "reward": {
+        "r_explore": 10.0,
+        "r_individual": 5.0,
+        "r_overlap": 3.0,
+        "r_balance": 0.5,
+        "r_collision": 50.0,
+        "r_step": 0.01,
+        "r_done": 150.0,
+
+        "use_explore": true,
+        "use_individual": true,
+        "use_overlap": true,
+        "use_balance": true,
+        "use_collision": true,
+        "use_step": true,
+        "use_done": true
+    }
+}

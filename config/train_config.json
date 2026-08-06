@@ -1,0 +1,28 @@
+{
+    "device": "auto",
+    "env_config": "env_config.json",
+    "model_config": "model_config.json",
+
+    "algorithm": "MAPPO",
+    "total_timesteps": 1000000,
+    "n_steps": 2048,
+    "n_epochs": 10,
+    "batch_size": 64,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "entropy_coef": 0.01,
+    "value_loss_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "actor_lr": 3e-4,
+    "critic_lr": 5e-4,
+
+    "amp": false,
+    "amp_dtype": "bfloat16",
+    "lr_schedule": "linear",
+
+    "save_dir": "models",
+    "save_freq": 50000,
+    "log_freq": 2048,
+    "seed": 0
+}
