@@ -23,7 +23,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'train_mappo = multi_robot_rl.scripts.train_mappo:main',
+            'train_mappo = multi_robot_rl.train_entry:main',
             'agent_node = multi_robot_rl.agent_node:main',
         ],
     },

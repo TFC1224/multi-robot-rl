@@ -1,23 +1,21 @@
-"""Launch 3 distributed agent nodes (pure CTDE execution)."""
+"""Launch N distributed agent nodes (pure CTDE execution).
+
+Uses OpaqueFunction to properly resolve LaunchConfiguration arguments at
+runtime, avoiding type errors with ``.perform(None)``.
+"""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-def generate_launch_description():
-    model_path_arg = DeclareLaunchArgument(
-        'model_path', default_value='models/mappo_actor.pth',
-        description='Path to the trained DistributedActor weights.')
-    n_agents_arg = DeclareLaunchArgument(
-        'n_agents', default_value='3',
-        description='Number of robots to launch (default 3).')
-    device_arg = DeclareLaunchArgument(
-        'device', default_value='cpu',
-        description='Inference device for the actor.')
+def _launch_nodes(context, *args, **kwargs):
+    """Build agent Node list dynamically from launch arguments."""
+    n_agents = int(LaunchConfiguration('n_agents').perform(context))
+    model_path = LaunchConfiguration('model_path').perform(context)
+    device = LaunchConfiguration('device').perform(context)
 
-    n_agents = int(LaunchConfiguration('n_agents').perform(None))
     nodes = []
     for i in range(n_agents):
         nodes.append(Node(
@@ -27,14 +25,23 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'robot_id': i,
-                'model_path': LaunchConfiguration('model_path'),
-                'device': LaunchConfiguration('device'),
+                'model_path': model_path,
+                'device': device,
             }],
         ))
+    return nodes
 
+
+def generate_launch_description():
     return LaunchDescription([
-        model_path_arg,
-        n_agents_arg,
-        device_arg,
-        *nodes,
+        DeclareLaunchArgument(
+            'model_path', default_value='models/mappo_actor.pth',
+            description='Path to the trained DistributedActor weights.'),
+        DeclareLaunchArgument(
+            'n_agents', default_value='3',
+            description='Number of robots to launch (default 3).'),
+        DeclareLaunchArgument(
+            'device', default_value='cpu',
+            description='Inference device for the actor.'),
+        OpaqueFunction(function=_launch_nodes),
     ])

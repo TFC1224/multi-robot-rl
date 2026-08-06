@@ -106,22 +106,25 @@ def _conv2d_same(x: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 
 def _cluster_centroids(rs: np.ndarray, cs: np.ndarray,
                        min_sep: int) -> np.ndarray:
-    """Greedy farthest-point clustering: pick the first cell, then pick
-    cells that are at least ``min_sep`` cells away from all picked cells,
-    until exhausted."""
+    """Greedy farthest-point clustering: pick the first cell, then iteratively
+    pick the cell whose minimum Chebyshev distance to *all* previously picked
+    cells is maximized.  Stops when no unpicked cell is at least ``min_sep``
+    away from every picked cell."""
     if rs.size == 0:
         return np.zeros((0, 2), dtype=np.int32)
-    pts = np.stack([rs, cs], axis=1)
+    pts = np.stack([rs, cs], axis=1).astype(np.float64)
     picked: list[int] = [0]
     while True:
-        last = pts[picked[-1]]
-        d = np.max(np.abs(pts - last), axis=1)
-        # Mask out already picked
+        picked_arr = pts[picked]                         # (K, 2)
+        # Chebyshev distance from every point to every picked point → (N, K)
+        d_all = np.max(np.abs(
+            pts[:, None, :] - picked_arr[None, :, :]), axis=2)
+        d_min = d_all.min(axis=1)                        # (N,) — min distance to any picked
         mask = np.ones(len(pts), dtype=bool)
         mask[picked] = False
-        d_masked = np.where(mask, d, -1)
+        d_masked = np.where(mask, d_min, -1.0)
         idx = int(np.argmax(d_masked))
-        if d_masked[idx] < min_sep:
+        if d_masked[idx] < float(min_sep):
             break
         picked.append(idx)
-    return pts[picked]
+    return pts[picked].astype(np.int32)

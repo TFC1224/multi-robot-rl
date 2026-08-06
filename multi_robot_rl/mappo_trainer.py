@@ -291,8 +291,6 @@ class MAPPOTrainer:
                 critic_loss = F.mse_loss(v_pred, v_target)
                 self.critic_optim.zero_grad(set_to_none=True)
                 critic_loss.backward()
-                self.critic_optim.zero_grad(set_to_none=True)
-                critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     self.critic.parameters(), self.cfg.max_grad_norm)
                 self.critic_optim.step()
