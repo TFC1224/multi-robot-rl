@@ -1,0 +1,7 @@
+numpy>=1.21
+torch>=2.0
+gymnasium>=0.29
+tensorboard>=2.14
+onnx>=1.14
+onnxruntime>=1.18
+pyyaml>=6.0

@@ -16,7 +16,12 @@ setup(
                                                   'config/env_config.json',
                                                   'config/model_config.json']),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'numpy',
+        'torch',
+        'gymnasium',
+        'setuptools',
+    ],
     zip_safe=True,
     maintainer='DLUT ROS Course',
     maintainer_email='ros@dlut.edu.cn',

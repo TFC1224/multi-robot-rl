@@ -239,39 +239,86 @@ clock bridge                    ── /clock → ROS 时间
 
 ```bash
 cd ~/experiment_ws
+
+# 安装 Python 依赖
+cd src/multi_robot_rl
+pip install -r requirements.txt
+cd ~/experiment_ws
+
+# 构建 ROS 2 包
 colcon build --packages-select multi_robot_rl
 source install/setup.bash
 ```
 
 ### 5.2 训练流程(2D 栅格环境)
 
-```bash
-# 纯 Python 方式,无需 ROS 2
-python scripts/train_mappo.py --total_timesteps 1000000 --scenario multi_1
+**JSON 配置模式**(推荐):
 
-# 通过 ROS 2 launch 方式
-ros2 launch multi_robot_rl training.launch.py \
-    scenario:=multi_1 total_timesteps:=1000000
+```bash
+# 新训练运行
+python -m multi_robot_rl.train_entry --fresh --tag baseline
+
+# 从 checkpoint 恢复
+python -m multi_robot_rl.train_entry --resume runs/multi_1/20260806-baseline
+
+# 按 tag 恢复
+python -m multi_robot_rl.train_entry --resume baseline
+
+# CLI 覆盖配置参数
+python -m multi_robot_rl.train_entry --tag experiment --total_timesteps 500000 --n_agents 4
+
+# 启动 TensorBoard 服务
+python -m multi_robot_rl.train_entry --tag baseline --port 6006
 ```
 
-输出: `models/mappo_actor.pth`、`models/mappo_critic.pth`(gitignored)。
+配置文件位于 `config/` 目录:
+- `train_config.json` — PPO 超参数、AMP、日志/保存设置
+- `env_config.json` — 环境参数(场景、覆盖率、智能体数量、奖励权重)
+- `model_config.json` — 网络结构(CNN 通道、隐藏层维度、正交初始化)
 
-多场景训练协议:
+运行时 TensorBoard 日志写入 `runs/{scenario}/{timestamp}[-{tag}]/tensorboard/`。
+
+**legacy CLI 模式**:
+
+```bash
+python -m multi_robot_rl.train_entry --total_timesteps 1000000 --scenario multi_1
+```
+
+多场景训练:
 
 ```bash
 # 基准场景
-python scripts/train_mappo.py --scenario multi_1 --total_timesteps 1000000
+python -m multi_robot_rl.train_entry --tag multi1 --scenario multi_1
 
 # 中等难度
-python scripts/train_mappo.py --scenario multi_2 --total_timesteps 1000000
+python -m multi_robot_rl.train_entry --tag multi2 --scenario multi_2
 
 # 最难场景
-python scripts/train_mappo.py --scenario multi_3 --total_timesteps 1500000
+python -m multi_robot_rl.train_entry --tag multi3 --scenario multi_3 --total_timesteps 1500000
 ```
 
 `--seed` 参数可使用不同随机种子重复运行同一场景(报告数据默认使用 5 个种子)。
 
-### 5.3 Gazebo + ROS 2 完整仿真栈
+### 5.3 评估
+
+```bash
+# 评估训练好的模型
+python scripts/eval_mappo.py --ckpt runs/multi_1/baseline --n_episodes 20
+
+# 输出 JSON 结果
+python scripts/eval_mappo.py --ckpt runs/multi_1/baseline --json eval_results.json
+```
+
+### 5.4 ONNX 导出
+
+```bash
+# 导出为 ONNX 格式(含数值校验)
+python tools/export_onnx.py --ckpt runs/multi_1/baseline -o exported/
+
+# 输出: exported/policy.onnx + exported/meta.json
+```
+
+### 5.5 Gazebo + ROS 2 完整仿真栈
 
 ```bash
 ros2 launch multi_robot_rl simulation.launch.py \
@@ -294,7 +341,7 @@ ROS_NAMESPACE=robot_1 ros2 run multi_robot_rl agent_node \
 
 发布目标点到 `/robot_<i>/move_base_simple/goal`,由机器人上的 `move_base` 动作服务器消费。
 
-### 5.4 裸机部署(3 台 Jetson Orin NX)
+### 5.6 裸机部署(3 台 Jetson Orin NX)
 
 无 Gazebo 时,`deployment.launch.py` 跳过仿真器,假设 `agent_node`
 直接在各 Jetson 上运行,各指向自身的 `/robot_<i>/map` 和 `/amcl_pose`。
@@ -306,7 +353,7 @@ ros2 launch multi_robot_rl deployment.launch.py \
     model_path:=/path/to/mappo_actor.pth n_agents:=3
 ```
 
-### 5.5 仓库结构
+### 5.7 仓库结构
 
 ```
 multi-robot-rl/
@@ -314,33 +361,35 @@ multi-robot-rl/
 ├── setup.py
 ├── setup.cfg
 ├── README.md
+├── requirements.txt                # Python 依赖
 ├── .gitignore
 ├── config/
-│   └── mappo_config.yaml           # MAPPO 超参数
+│   ├── train_config.json           # PPO 超参数 + AMP + 日志设置
+│   ├── env_config.json             # 环境参数 + 奖励权重
+│   └── model_config.json           # 网络结构 + 正交初始化参数
 ├── launch/
 │   ├── training.launch.py          # 2D 栅格环境 + MAPPO 训练器
-│   ├── deployment.launch.py        # 3 × agent_node
-│   ├── simulation.launch.py        # 完整 Gazebo + ROS 2 仿真栈
-│   └── spawn_robots.launch.py      # 3 × spawn_entity from ros_gz_sim
-├── worlds/
-│   └── multi_room.world            # 双房间 + 4 个障碍物箱子
-├── urdf/
-│   ├── roslander.urdf.xacro        # 差速驱动底盘 + 2D LiDAR + IMU
-│   └── roslander.gazebo.xacro      # Gazebo 插件(ros_gz, ros2_control)
+│   └── deployment.launch.py        # 3 × agent_node
 ├── scripts/
-│   ├── __init__.py
-│   └── train_mappo.py              # 训练入口脚本
+│   └── eval_mappo.py               # 离线评估脚本
+├── tools/
+│   └── export_onnx.py              # ONNX 导出工具(onxxruntime 校验)
+├── runs/                           # 训练运行目录(时间戳 + tag)
 └── multi_robot_rl/
     ├── __init__.py
     ├── grid_world.py               # 3 场景,感知,运动,指标
-    ├── frontier_detector.py        # 8 邻域卷积 + 贪心聚类前沿检测
+    ├── frontier_detector.py        # 8 邻域卷积 + Farthest-point 聚类
     ├── reward_functions.py         # 7 项团队奖励 + Jain 公平性
+    ├── observation.py              # 共享观测构建(训练 + 部署共用)
     ├── multi_agent_env.py          # Gymnasium 多智能体环境接口
-    ├── networks.py                 # DistributedActor, CentralizedCritic
+    ├── networks.py                 # DistributedActor + CentralizedCritic
     ├── replay_buffer.py            # On-policy Rollout 缓冲 + GAE
-    ├── mappo_trainer.py            # 收集 → 更新 → 保存循环
-    ├── agent_node.py               # ROS 2 Actor 节点,订阅 /merged_map
-    └── shared_map_publisher.py     # ROS 组件: /merged_map → 局部窗口
+    ├── mappo_trainer.py            # 训练循环 + AMP + 值归一化
+    ├── config_loader.py            # JSON 配置加载 + CLI 覆盖
+    ├── metric_writer.py            # TensorBoard + JSONL 双通道日志
+    ├── run_manager.py              # 运行目录管理 + 统一 checkpoint
+    ├── train_entry.py              # 训练 CLI 入口(--fresh/--resume/--tag)
+    └── agent_node.py               # ROS 2 Actor 节点
 ```
 
 ---
