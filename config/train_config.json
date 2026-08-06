@@ -20,6 +20,7 @@
     "amp": false,
     "amp_dtype": "bfloat16",
     "lr_schedule": "linear",
+    "value_norm": true,
 
     "save_dir": "models",
     "save_freq": 50000,

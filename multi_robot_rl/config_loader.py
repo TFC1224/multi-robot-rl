@@ -111,6 +111,9 @@ def load_train_config(path: str | Path | None) -> Dict[str, Any]:
     cfg.setdefault('amp', False)
     cfg.setdefault('amp_dtype', 'bfloat16')
     cfg.setdefault('lr_schedule', 'none')
+    cfg.setdefault('value_norm', False)
+    cfg.setdefault('ortho_init', False)
+    cfg.setdefault('ortho_gain', 0.01)
 
     cfg.setdefault('save_dir', 'models')
     cfg.setdefault('save_freq', 50_000)

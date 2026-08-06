@@ -18,6 +18,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _ortho_init(module: nn.Module, gain: float = 1.0) -> None:
+    """Orthogonal weight initialization for Conv2d and Linear layers."""
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        nn.init.orthogonal_(module.weight, gain=gain)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+
+
 # ----------------------------------------------------------------------
 # Reusable building blocks
 # ----------------------------------------------------------------------
@@ -29,7 +37,8 @@ class MapEncoder(nn.Module):
     weights and compare behaviours across single- and multi-agent setups.
     """
 
-    def __init__(self, in_channels: int = 3, out_dim: int = 128):
+    def __init__(self, in_channels: int = 3, out_dim: int = 128,
+                 ortho_init: bool = False):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1), nn.ReLU(),
@@ -42,6 +51,8 @@ class MapEncoder(nn.Module):
             nn.Flatten(),
         )
         self.proj = nn.Linear(128, out_dim)
+        if ortho_init:
+            self.apply(_ortho_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.relu(self.proj(self.conv(x)))
@@ -55,12 +66,14 @@ class DistributedActor(nn.Module):
     """Per-agent policy network. Returns action logits over MAX_FRONTIERS."""
 
     def __init__(self, n_actions: int = 16, map_channels: int = 3,
-                 n_teammates: int = 2):
+                 n_teammates: int = 2, ortho_init: bool = False,
+                 ortho_gain: float = 1.0):
         super().__init__()
         self.n_actions = n_actions
         self.n_teammates = n_teammates
 
-        self.map_encoder = MapEncoder(in_channels=map_channels, out_dim=128)
+        self.map_encoder = MapEncoder(in_channels=map_channels, out_dim=128,
+                                      ortho_init=ortho_init)
         self.pose_encoder = nn.Sequential(nn.Linear(4, 32), nn.ReLU())
         self.teammate_encoder = nn.Sequential(
             nn.Linear(n_teammates * 4, 64), nn.ReLU())
@@ -73,6 +86,13 @@ class DistributedActor(nn.Module):
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, n_actions),
         )
+
+        if ortho_init:
+            self.apply(_ortho_init)
+            # Policy final layer → small init for exploration (GRALP convention)
+            last_linear = self.policy_head[-1]
+            nn.init.orthogonal_(last_linear.weight, gain=ortho_gain)
+            nn.init.constant_(last_linear.bias, 0)
 
     def forward(self, local_map: torch.Tensor, own_pose: torch.Tensor,
                 teammates: torch.Tensor, frontiers: torch.Tensor,
@@ -101,11 +121,13 @@ class DistributedActor(nn.Module):
 class CentralizedCritic(nn.Module):
     """Centralized value network. Sees the shared map + all agent poses."""
 
-    def __init__(self, n_agents: int = 3, map_channels: int = 3):
+    def __init__(self, n_agents: int = 3, map_channels: int = 3,
+                 ortho_init: bool = False):
         super().__init__()
         self.n_agents = n_agents
 
-        self.map_encoder = MapEncoder(in_channels=map_channels, out_dim=128)
+        self.map_encoder = MapEncoder(in_channels=map_channels, out_dim=128,
+                                      ortho_init=ortho_init)
         self.pos_encoder = nn.Sequential(
             nn.Linear(n_agents * 2, 64), nn.ReLU(),
             nn.Linear(64, 64),
@@ -118,6 +140,9 @@ class CentralizedCritic(nn.Module):
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1),
         )
+
+        if ortho_init:
+            self.apply(_ortho_init)
 
     def forward(self, shared_map: torch.Tensor,
                 robot_positions: torch.Tensor, robot_oris: torch.Tensor,

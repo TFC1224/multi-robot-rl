@@ -51,6 +51,9 @@ class TrainConfig:
     use_amp: bool = False
     amp_dtype: str = 'bfloat16'
     lr_schedule: str = 'none'  # 'none' | 'linear'
+    ortho_init: bool = False
+    ortho_gain: float = 0.01
+    value_norm: bool = False
 
     @classmethod
     def from_configs(cls, configs: Dict[str, Any]) -> 'TrainConfig':
@@ -82,6 +85,9 @@ class TrainConfig:
             use_amp=train.get('amp', False),
             amp_dtype=train.get('amp_dtype', 'bfloat16'),
             lr_schedule=train.get('lr_schedule', 'none'),
+            ortho_init=model.get('ortho_init', train.get('ortho_init', False)),
+            ortho_gain=model.get('ortho_gain', train.get('ortho_gain', 0.01)),
+            value_norm=train.get('value_norm', False),
         )
 
 
@@ -106,19 +112,58 @@ class MAPPOTrainer:
         ))
         self.n_agents = self.env.n_agents
 
-        self.actor = DistributedActor(n_actions=MAX_FRONTIERS,
-                                      n_teammates=self.n_agents - 1).to(self.device)
-        self.critic = CentralizedCritic(n_agents=self.n_agents).to(self.device)
+        # Build networks with optional orthogonal init
+        self.actor = DistributedActor(
+            n_actions=MAX_FRONTIERS,
+            n_teammates=self.n_agents - 1,
+            ortho_init=self.cfg.ortho_init,
+            ortho_gain=self.cfg.ortho_gain,
+        ).to(self.device)
+        self.critic = CentralizedCritic(
+            n_agents=self.n_agents,
+            ortho_init=self.cfg.ortho_init,
+        ).to(self.device)
 
         self.actor_optim = torch.optim.Adam(self.actor.parameters(),
                                             lr=self.cfg.actor_lr)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(),
                                              lr=self.cfg.critic_lr)
 
+        # ── AMP (automatic mixed precision) ──────────────────────────
+        self._amp_dtype = {
+            'float16': torch.float16,
+            'bfloat16': torch.bfloat16,
+        }.get(self.cfg.amp_dtype, torch.bfloat16)
+        self._scaler = None
+        if self.cfg.use_amp:
+            if self.device.type == 'cuda':
+                self._scaler = torch.cuda.amp.GradScaler()
+            else:
+                print('[MAPPO] WARNING: AMP requested but device is CPU; '
+                      'disabling AMP')
+
+        # ── LR schedulers ───────────────────────────────────────────
+        self.actor_scheduler = None
+        self.critic_scheduler = None
+        if self.cfg.lr_schedule == 'linear':
+            self.actor_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.actor_optim, start_factor=1.0, end_factor=0.0,
+                total_iters=self.cfg.total_timesteps // self.cfg.n_steps)
+            self.critic_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.critic_optim, start_factor=1.0, end_factor=0.0,
+                total_iters=self.cfg.total_timesteps // self.cfg.n_steps)
+
+        # ── Value normalization (running mean/std) ───────────────────
+        self._value_mean = 0.0
+        self._value_var = 1.0
+        self._value_count = 0
+
         self.buffer_cfg = BufferConfig(
             n_steps=self.cfg.n_steps,
             n_agents=self.n_agents,
             max_frontiers=MAX_FRONTIERS,
+            gamma=self.cfg.gamma,
+            gae_lambda=self.cfg.gae_lambda,
         )
         self.buffer = RolloutBuffer(self.buffer_cfg)
 
@@ -157,22 +202,29 @@ class MAPPOTrainer:
         frontiers_t = torch.from_numpy(frontiers).to(self.device)
         n_frontiers_t = torch.from_numpy(n_frontiers).to(self.device)
 
-        logits = self.actor(local_maps_t, own_poses_t, teammates_t,
-                            frontiers_t, n_frontiers_t)
+        # AMP: autocast forward pass
+        with torch.cuda.amp.autocast(
+                dtype=self._amp_dtype,
+                enabled=self.cfg.use_amp and self.device.type == 'cuda'):
+            logits = self.actor(local_maps_t, own_poses_t, teammates_t,
+                                frontiers_t, n_frontiers_t)
         dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
         log_probs = dist.log_prob(actions)
 
         g = self._global_state_batch()
-        value = self.critic(
-            torch.from_numpy(g['shared_map']).to(self.device),
-            torch.from_numpy(g['robot_positions']).to(self.device),
-            torch.from_numpy(g['robot_oris']).to(self.device),
-            torch.cat([
-                torch.from_numpy(g['team_coverage']).to(self.device),
-                torch.from_numpy(g['step_count']).to(self.device),
-            ], dim=1),
-        ).squeeze().item()
+        with torch.cuda.amp.autocast(
+                dtype=self._amp_dtype,
+                enabled=self.cfg.use_amp and self.device.type == 'cuda'):
+            value = self.critic(
+                torch.from_numpy(g['shared_map']).to(self.device),
+                torch.from_numpy(g['robot_positions']).to(self.device),
+                torch.from_numpy(g['robot_oris']).to(self.device),
+                torch.cat([
+                    torch.from_numpy(g['team_coverage']).to(self.device),
+                    torch.from_numpy(g['step_count']).to(self.device),
+                ], dim=1),
+            ).squeeze().item()
 
         return (actions.cpu().numpy(), log_probs.cpu().numpy(),
                 local_maps, own_poses, teammates, frontiers, n_frontiers,
@@ -211,7 +263,8 @@ class MAPPOTrainer:
                 rewards=np.asarray(rewards, dtype=np.float32),
                 team_reward=float(info.get('team_reward',
                                            float(np.mean(rewards)))),
-                done=done,
+                terminated=bool(terminated),
+                truncated=bool(truncated),
             )
 
             if done:
@@ -230,22 +283,45 @@ class MAPPOTrainer:
         tensors = self.buffer.to_tensors(self.device)
 
         # Bootstrap value for the state after the last collected step.
-        # We re-run critic on the current env observation for simplicity.
         with torch.no_grad():
             g = self._global_state_batch()
-            last_value = self.critic(
-                torch.from_numpy(g['shared_map']).to(self.device),
-                torch.from_numpy(g['robot_positions']).to(self.device),
-                torch.from_numpy(g['robot_oris']).to(self.device),
-                torch.cat([
-                    torch.from_numpy(g['team_coverage']).to(self.device),
-                    torch.from_numpy(g['step_count']).to(self.device),
-                ], dim=1),
-            ).squeeze().item()
-            last_done = bool(self.env.step_count >= self.env._max_steps)
+            with torch.amp.autocast(
+                    self.device.type, dtype=self._amp_dtype,
+                    enabled=self.cfg.use_amp):
+                last_value_raw = self.critic(
+                    torch.from_numpy(g['shared_map']).to(self.device),
+                    torch.from_numpy(g['robot_positions']).to(self.device),
+                    torch.from_numpy(g['robot_oris']).to(self.device),
+                    torch.cat([
+                        torch.from_numpy(g['team_coverage']).to(self.device),
+                        torch.from_numpy(g['step_count']).to(self.device),
+                    ], dim=1),
+                ).squeeze().item()
+            # Denormalize for GAE computation
+            last_value = (last_value_raw * np.sqrt(self._value_var + 1e-8)
+                          + self._value_mean)
+
+        last_done = bool(self.env.step_count >= self.env._max_steps)
         adv, ret = self.buffer.compute_advantages(last_value, last_done)
         advantages = torch.from_numpy(adv).to(self.device)
         returns = torch.from_numpy(ret).to(self.device)
+
+        # ── Update value running stats ─────────────────────────
+        new_count = self._value_count + len(ret)
+        batch_mean = float(returns.mean())
+        batch_var = float(returns.var())
+        delta = batch_mean - self._value_mean
+        self._value_mean += delta * len(ret) / max(new_count, 1)
+        m2_old = self._value_var * self._value_count
+        m2_new = batch_var * len(ret)
+        self._value_var = (m2_old + m2_new + delta**2 * self._value_count * len(ret) / max(new_count, 1)) / max(new_count, 1)
+        self._value_count = int(new_count)
+
+        # ── Normalize returns for critic target ────────────────
+        if self.cfg.value_norm:
+            returns_norm = (returns - self._value_mean) / np.sqrt(self._value_var + 1e-8)
+        else:
+            returns_norm = returns
 
         n = self.buffer.cfg.n_steps
         a = self.buffer.cfg.n_agents
@@ -288,8 +364,11 @@ class MAPPOTrainer:
                     mb_lp = old_lp.index_select(0, mb_t)
                     mb_adv = adv_flat.index_select(0, mb_t)
 
-                    logits = self.actor(mb_local, mb_pose, mb_team,
-                                        mb_front, mb_nf)
+                    with torch.cuda.amp.autocast(
+                            dtype=self._amp_dtype,
+                            enabled=self.cfg.use_amp and self.device.type == 'cuda'):
+                        logits = self.actor(mb_local, mb_pose, mb_team,
+                                            mb_front, mb_nf)
                     dist = torch.distributions.Categorical(logits=logits)
                     new_lp = dist.log_prob(mb_act)
                     entropy = dist.entropy().mean()
@@ -307,31 +386,49 @@ class MAPPOTrainer:
 
                     loss = actor_loss - self.cfg.entropy_coef * entropy
                     self.actor_optim.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        self.actor.parameters(), self.cfg.max_grad_norm)
-                    self.actor_optim.step()
+                    if self._scaler is not None:
+                        self._scaler.scale(loss).backward()
+                        self._scaler.unscale_(self.actor_optim)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.actor.parameters(), self.cfg.max_grad_norm)
+                        self._scaler.step(self.actor_optim)
+                        self._scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            self.actor.parameters(), self.cfg.max_grad_norm)
+                        self.actor_optim.step()
 
-                # ---- critic update (one minibatch per step indices, since
-                # critic input is global-state only) ----
+                # ---- critic update (one minibatch per step indices) ----
                 mb_idx = torch.from_numpy(mb).long().to(self.device)
-                v_pred = self.critic(
-                    tensors['shared_maps'].reshape(n, 3, 64, 64)
-                        .index_select(0, mb_idx),
-                    tensors['robot_positions'].reshape(n, a * 2)
-                        .index_select(0, mb_idx),
-                    tensors['robot_oris'].reshape(n, a * 2)
-                        .index_select(0, mb_idx),
-                    tensors['team_stats'].reshape(n, 2)
-                        .index_select(0, mb_idx),
-                ).squeeze(-1)
-                v_target = returns[mb_idx]
+                with torch.amp.autocast(
+                        self.device.type, dtype=self._amp_dtype,
+                        enabled=self.cfg.use_amp):
+                    v_pred = self.critic(
+                        tensors['shared_maps'].reshape(n, 3, 64, 64)
+                            .index_select(0, mb_idx),
+                        tensors['robot_positions'].reshape(n, a * 2)
+                            .index_select(0, mb_idx),
+                        tensors['robot_oris'].reshape(n, a * 2)
+                            .index_select(0, mb_idx),
+                        tensors['team_stats'].reshape(n, 2)
+                            .index_select(0, mb_idx),
+                    ).squeeze(-1)
+                v_target = returns_norm[mb_idx]
                 critic_loss = F.mse_loss(v_pred, v_target)
                 self.critic_optim.zero_grad(set_to_none=True)
-                critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.critic.parameters(), self.cfg.max_grad_norm)
-                self.critic_optim.step()
+                if self._scaler is not None:
+                    self._scaler.scale(critic_loss).backward()
+                    self._scaler.unscale_(self.critic_optim)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.critic.parameters(), self.cfg.max_grad_norm)
+                    self._scaler.step(self.critic_optim)
+                    self._scaler.update()
+                else:
+                    critic_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.critic.parameters(), self.cfg.max_grad_norm)
+                    self.critic_optim.step()
 
                 critic_losses.append(critic_loss.item())
                 actor_losses.append(actor_loss_epoch / a)
@@ -351,12 +448,24 @@ class MAPPOTrainer:
               writer = None, run_dir: str | Path | None = None) -> None:
         total = total_timesteps or self.cfg.total_timesteps
         print(f'[MAPPO] Starting training: {total:,} steps on {self.device}')
+        if self.cfg.use_amp:
+            print(f'[MAPPO] AMP enabled (dtype={self.cfg.amp_dtype})')
+        if self.cfg.ortho_init:
+            print(f'[MAPPO] Orthogonal init enabled (final gain={self.cfg.ortho_gain})')
+        if self.cfg.value_norm:
+            print(f'[MAPPO] Value normalization enabled')
         start = time.time()
 
         for timestep in range(0, total, self.cfg.n_steps):
             current_step = timestep + self.cfg.n_steps
             self.collect_rollouts(self.cfg.n_steps)
             metrics = self.update()
+
+            # Step LR schedulers
+            if self.actor_scheduler is not None:
+                self.actor_scheduler.step()
+            if self.critic_scheduler is not None:
+                self.critic_scheduler.step()
 
             # Compute rolling stats every iteration (cheap — just slicing)
             avg_return = (np.mean(self.episode_returns[-10:])
@@ -368,6 +477,7 @@ class MAPPOTrainer:
                     1, self.cfg.log_freq // self.cfg.n_steps) == 0:
                 elapsed = time.time() - start
                 sps = current_step / max(elapsed, 1e-3)
+                actor_lr = self.actor_optim.param_groups[0]['lr']
 
                 log_metrics = {
                     'sps': sps,
@@ -376,7 +486,12 @@ class MAPPOTrainer:
                     'actor_loss': metrics['actor_loss'],
                     'critic_loss': metrics['critic_loss'],
                     'entropy': metrics['entropy'],
+                    'actor_lr': actor_lr,
                 }
+                if self.cfg.value_norm:
+                    log_metrics['value_mean'] = float(self._value_mean)
+                    log_metrics['value_std'] = float(np.sqrt(self._value_var + 1e-8))
+
                 print(
                     f'[MAPPO] step={current_step:>8d} '
                     f'sps={sps:6.1f} '
@@ -384,7 +499,8 @@ class MAPPOTrainer:
                     f'coverage={avg_cov:.3f} '
                     f'actor_loss={metrics["actor_loss"]:+.4f} '
                     f'critic_loss={metrics["critic_loss"]:+.4f} '
-                    f'entropy={metrics["entropy"]:.4f}'
+                    f'entropy={metrics["entropy"]:.4f} '
+                    f'lr={actor_lr:.2e}'
                 )
 
                 if writer is not None:
@@ -431,6 +547,9 @@ class MAPPOTrainer:
                 critic_state=self.critic.state_dict(),
                 actor_optim=self.actor_optim.state_dict(),
                 critic_optim=self.critic_optim.state_dict(),
+                scaler_state=self._scaler.state_dict() if self._scaler else None,
+                actor_scheduler=self.actor_scheduler.state_dict() if self.actor_scheduler else None,
+                critic_scheduler=self.critic_scheduler.state_dict() if self.critic_scheduler else None,
                 config={
                     'scenario': self.cfg.scenario,
                     'n_agents': self.n_agents,

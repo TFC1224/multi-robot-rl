@@ -25,7 +25,13 @@ class BufferConfig:
 
 
 class RolloutBuffer:
-    """Per-step storage for one rollout (n_steps transitions)."""
+    """Per-step storage for one rollout (n_steps transitions).
+
+    Distinguishes *terminated* (episode ended naturally, e.g. coverage reached)
+    from *truncated* (time-limit cut-off).  Only *terminated* steps zero out
+    the value bootstrap; *truncated* steps continue to bootstrap from the
+    value function since the episode would have continued otherwise.
+    """
 
     def __init__(self, cfg: BufferConfig):
         self.cfg = cfg
@@ -45,7 +51,8 @@ class RolloutBuffer:
         self.log_probs = np.zeros((n, a), dtype=np.float32)
         self.rewards = np.zeros((n, a), dtype=np.float32)
         self.team_rewards = np.zeros(n, dtype=np.float32)
-        self.dones = np.zeros(n, dtype=np.float32)
+        self.terminated = np.zeros(n, dtype=np.float32)   # true episode end
+        self.truncated = np.zeros(n, dtype=np.float32)    # time-limit cut-off
 
         # Global fields (shared map + team info)
         self.shared_maps = np.zeros((n, 3, cfg.map_size, cfg.map_size),
@@ -60,7 +67,7 @@ class RolloutBuffer:
     def add(self, *, local_maps, own_poses, teammates, frontiers,
             n_frontiers, shared_map, robot_positions, robot_oris,
             team_stats, actions, log_probs, value, rewards, team_reward,
-            done) -> None:
+            terminated: bool = False, truncated: bool = False) -> None:
         i = self._idx
         self.local_maps[i] = local_maps
         self.own_poses[i] = own_poses
@@ -76,7 +83,8 @@ class RolloutBuffer:
         self.values[i] = value
         self.rewards[i] = rewards
         self.team_rewards[i] = team_reward
-        self.dones[i] = float(done)
+        self.terminated[i] = float(terminated)
+        self.truncated[i] = float(truncated)
         self._idx += 1
 
     def __len__(self) -> int:
@@ -88,7 +96,12 @@ class RolloutBuffer:
 
     def compute_advantages(self, last_value: float,
                            last_done: bool) -> tuple[np.ndarray, np.ndarray]:
-        """Compute advantages and returns based on team rewards + values."""
+        """Compute advantages and returns based on team rewards + values.
+
+        Key difference from naive GAE: *truncated* steps (time-limit) still
+        bootstrap from the value function — only *terminated* steps (true
+        episode end) zero out the value bootstrap.
+        """
         n = len(self)
         gamma = self.cfg.gamma
         lam = self.cfg.gae_lambda
@@ -98,16 +111,18 @@ class RolloutBuffer:
         next_value = float(last_value)
         next_non_terminal = 0.0 if last_done else 1.0
         for t in reversed(range(n)):
-            if self.dones[t]:
+            if self.terminated[t]:
+                # True episode end — no future value
                 next_non_terminal = 0.0
                 next_value = 0.0
                 last_gae = 0.0
+            # Note: truncated[t] does NOT reset — we continue bootstrapping
             delta = self.team_rewards[t] + gamma * next_value * next_non_terminal \
                 - self.values[t]
             last_gae = delta + gamma * lam * next_non_terminal * last_gae
             advantages[t] = last_gae
             next_value = self.values[t]
-            next_non_terminal = 1.0 - self.dones[t]
+            next_non_terminal = 1.0 - self.terminated[t]
         returns = advantages + self.values[:n]
         return advantages, returns
 
@@ -131,5 +146,6 @@ class RolloutBuffer:
             'values': torch.from_numpy(self.values).to(device),
             'rewards': torch.from_numpy(self.rewards).to(device),
             'team_rewards': torch.from_numpy(self.team_rewards).to(device),
-            'dones': torch.from_numpy(self.dones).to(device),
+            'terminated': torch.from_numpy(self.terminated).to(device),
+            'truncated': torch.from_numpy(self.truncated).to(device),
         }

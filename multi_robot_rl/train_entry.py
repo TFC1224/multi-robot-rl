@@ -72,6 +72,8 @@ def parse_args(argv=None):
     p.add_argument('--value_loss_coef', type=float, default=None)
     p.add_argument('--max_grad_norm', type=float, default=None)
     p.add_argument('--amp', action='store_true', default=None)
+    p.add_argument('--no-amp', action='store_false', dest='amp',
+                   default=None, help='Disable AMP.')
 
     # ── logging & checkpointing ──────────────────────────────────
     p.add_argument('--save_freq', type=int, default=None)
