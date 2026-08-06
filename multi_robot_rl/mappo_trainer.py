@@ -347,24 +347,38 @@ class MAPPOTrainer:
     # Main loop
     # ------------------------------------------------------------------
 
-    def train(self, total_timesteps: int | None = None) -> None:
+    def train(self, total_timesteps: int | None = None,
+              writer = None, run_dir: str | Path | None = None) -> None:
         total = total_timesteps or self.cfg.total_timesteps
-        print(f'[MAPPO] Starting training: {total} steps on {self.device}')
+        print(f'[MAPPO] Starting training: {total:,} steps on {self.device}')
         start = time.time()
+
         for timestep in range(0, total, self.cfg.n_steps):
+            current_step = timestep + self.cfg.n_steps
             self.collect_rollouts(self.cfg.n_steps)
             metrics = self.update()
+
+            # Compute rolling stats every iteration (cheap — just slicing)
+            avg_return = (np.mean(self.episode_returns[-10:])
+                          if self.episode_returns else 0.0)
+            avg_cov = (np.mean(self.episode_coverages[-10:])
+                       if self.episode_coverages else 0.0)
 
             if (timestep // self.cfg.n_steps) % max(
                     1, self.cfg.log_freq // self.cfg.n_steps) == 0:
                 elapsed = time.time() - start
-                sps = (timestep + self.cfg.n_steps) / max(elapsed, 1e-3)
-                avg_return = (np.mean(self.episode_returns[-10:])
-                              if self.episode_returns else 0.0)
-                avg_cov = (np.mean(self.episode_coverages[-10:])
-                           if self.episode_coverages else 0.0)
+                sps = current_step / max(elapsed, 1e-3)
+
+                log_metrics = {
+                    'sps': sps,
+                    'return': avg_return,
+                    'coverage': avg_cov,
+                    'actor_loss': metrics['actor_loss'],
+                    'critic_loss': metrics['critic_loss'],
+                    'entropy': metrics['entropy'],
+                }
                 print(
-                    f'[MAPPO] step={timestep + self.cfg.n_steps:>8d} '
+                    f'[MAPPO] step={current_step:>8d} '
                     f'sps={sps:6.1f} '
                     f'return={avg_return:7.2f} '
                     f'coverage={avg_cov:.3f} '
@@ -373,26 +387,71 @@ class MAPPOTrainer:
                     f'entropy={metrics["entropy"]:.4f}'
                 )
 
-            if ((timestep + self.cfg.n_steps) % self.cfg.save_freq == 0
-                    and (timestep + self.cfg.n_steps) > 0):
-                self.save(timestep + self.cfg.n_steps)
+                if writer is not None:
+                    writer.log(log_metrics, step=current_step, scope='train')
 
-        self.save(total)
+            if (current_step % self.cfg.save_freq == 0 and current_step > 0):
+                self.save(current_step, run_dir=run_dir,
+                          extra_metrics={'return': avg_return, 'coverage': avg_cov})
+
+        self.save(total, run_dir=run_dir)
+        if writer is not None:
+            writer.close()
 
     # ------------------------------------------------------------------
     # IO
     # ------------------------------------------------------------------
 
-    def save(self, timestep: int) -> None:
-        torch.save(self.actor.state_dict(),
-                   os.path.join(self.cfg.save_dir, f'mappo_actor_{timestep}.pth'))
-        torch.save(self.critic.state_dict(),
-                   os.path.join(self.cfg.save_dir, f'mappo_critic_{timestep}.pth'))
-        torch.save(self.actor.state_dict(),
-                   os.path.join(self.cfg.save_dir, 'mappo_actor.pth'))
-        torch.save(self.critic.state_dict(),
-                   os.path.join(self.cfg.save_dir, 'mappo_critic.pth'))
-        print(f'[MAPPO] Saved checkpoint at step {timestep}')
+    def save(self, timestep: int, *,
+             run_dir: str | Path | None = None,
+             extra_metrics: dict | None = None) -> None:
+        """Save a unified checkpoint.
+
+        If *run_dir* is provided, saves to ``<run_dir>/checkpoints/``
+        using the new unified format.  Otherwise falls back to the legacy
+        flat ``save_dir`` layout.
+        """
+        from .run_manager import save_checkpoint
+
+        metrics = {
+            'actor_loss': 0.0,
+            'critic_loss': 0.0,
+            'coverage': float(
+                np.mean(self.episode_coverages[-10:]) if self.episode_coverages else 0.0),
+        }
+        if extra_metrics:
+            metrics.update(extra_metrics)
+
+        if run_dir is not None:
+            ckpt_dir = Path(run_dir) / 'checkpoints'
+            save_checkpoint(
+                ckpt_dir,
+                step=timestep,
+                actor_state=self.actor.state_dict(),
+                critic_state=self.critic.state_dict(),
+                actor_optim=self.actor_optim.state_dict(),
+                critic_optim=self.critic_optim.state_dict(),
+                config={
+                    'scenario': self.cfg.scenario,
+                    'n_agents': self.n_agents,
+                    'target_coverage': self.cfg.target_coverage,
+                },
+                metrics=metrics,
+            )
+            print(f'[MAPPO] Saved checkpoint at step {timestep} → {ckpt_dir}')
+        else:
+            # Legacy flat save
+            save_dir = Path(self.cfg.save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(self.actor.state_dict(),
+                       save_dir / f'mappo_actor_{timestep}.pth')
+            torch.save(self.critic.state_dict(),
+                       save_dir / f'mappo_critic_{timestep}.pth')
+            torch.save(self.actor.state_dict(),
+                       save_dir / 'mappo_actor.pth')
+            torch.save(self.critic.state_dict(),
+                       save_dir / 'mappo_critic.pth')
+            print(f'[MAPPO] Saved checkpoint at step {timestep}')
 
     def load(self, path_actor: str, path_critic: str | None = None) -> None:
         self.actor.load_state_dict(torch.load(path_actor, map_location=self.device))
