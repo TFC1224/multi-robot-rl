@@ -23,6 +23,7 @@ from rclpy.node import Node
 from .frontier_detector import detect_frontiers
 from .multi_agent_env import LOCAL_MAP_SIZE, MAX_FRONTIERS, N_AGENTS
 from .networks import DistributedActor
+from .observation import build_observation, extract_local_map
 
 
 def _to_numpy(msg: OccupancyGrid) -> np.ndarray:
@@ -163,70 +164,38 @@ class AgentNode(Node):
         return row, col, theta
 
     def _build_observation(self) -> dict[str, np.ndarray]:
+        """Build observation using the shared observation module."""
         shared = _to_numpy(self.shared_map_msg)
         H, W = shared.shape
         r, c, theta = self._extract_pose_rc()
 
-        # 3-channel local map centered on robot
-        local_map = self._extract_local_map(shared, r, c)
+        local_map = extract_local_map(shared, (r, c), local_map_size=LOCAL_MAP_SIZE)
 
-        own_pose = np.array([
-            r / max(H - 1, 1) * 2 - 1,
-            c / max(W - 1, 1) * 2 - 1,
-            float(np.sin(theta)),
-            float(np.cos(theta)),
-        ], dtype=np.float32)
-
-        teammates = np.zeros((N_AGENTS - 1, 4), dtype=np.float32)
-        for k, msg in enumerate(self.teammate_poses):
+        # Resolve teammate poses (with missing-data tolerance)
+        teammate_poses = []
+        for msg in self.teammate_poses:
             if msg is None:
+                teammate_poses.append(None)
                 continue
             pose = msg.pose
             info = self.shared_map_msg.info
             tx = pose.position.x - info.origin.position.x
             ty = pose.position.y - info.origin.position.y
-            tr = ty / max(info.resolution, 1e-3)
-            tc = tx / max(info.resolution, 1e-3)
+            tr = int(ty / max(info.resolution, 1e-3))
+            tc = int(tx / max(info.resolution, 1e-3))
             q = pose.orientation
             siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
             t_theta = float(np.arctan2(siny_cosp, cosy_cosp))
-            teammates[k, 0] = (tr - r) / max(H - 1, 1)
-            teammates[k, 1] = (tc - c) / max(W - 1, 1)
-            teammates[k, 2] = float(np.sin(t_theta - theta))
-            teammates[k, 3] = float(np.cos(t_theta - theta))
+            teammate_poses.append((tr, tc, t_theta))
 
-        fronts, n_valid = detect_frontiers(
-            shared, (r, c), max_n=MAX_FRONTIERS)
-        return {
-            'local_map': local_map,
-            'own_pose': own_pose,
-            'teammates': teammates,
-            'frontiers': fronts,
-            'n_frontiers': int(n_valid),
-        }
-
-    def _extract_local_map(self, shared: np.ndarray, r: int, c: int) -> np.ndarray:
-        S = LOCAL_MAP_SIZE
-        H, W = shared.shape
-        half = S // 2
-        r0, r1 = r - half, r - half + S
-        c0, c1 = c - half, c - half + S
-        crop = np.full((S, S), 2, dtype=np.uint8)
-        src_r0 = max(r0, 0)
-        src_r1 = min(r1, H)
-        src_c0 = max(c0, 0)
-        src_c1 = min(c1, W)
-        if src_r1 > src_r0 and src_c1 > src_c0:
-            dst_r0 = src_r0 - r0
-            dst_r1 = dst_r0 + (src_r1 - src_r0)
-            dst_c0 = src_c0 - c0
-            dst_c1 = dst_c0 + (src_c1 - src_c0)
-            crop[dst_r0:dst_r1, dst_c0:dst_c1] = shared[src_r0:src_r1, src_c0:src_c1]
-        ch_free = (crop == 0).astype(np.float32)
-        ch_obstacle = (crop == 1).astype(np.float32)
-        ch_explored = ((crop == 0) | (crop == 1)).astype(np.float32)
-        return np.stack([ch_free, ch_obstacle, ch_explored], axis=0)
+        return build_observation(
+            local_map, (r, c, theta), (H, W),
+            teammate_poses=teammate_poses,
+            shared_occupancy=shared,
+            n_agents=N_AGENTS,
+            max_frontiers=MAX_FRONTIERS,
+        )
 
     def _obs_to_tensors(self, obs: dict) -> dict[str, torch.Tensor]:
         return {

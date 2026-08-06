@@ -16,6 +16,7 @@ from gymnasium import spaces
 
 from .frontier_detector import detect_frontiers
 from .grid_world import FREE, OCCUPIED, UNKNOWN, GridWorld
+from .observation import build_observation, extract_local_map
 from .reward_functions import RewardWeights, compute_team_reward, jain_index
 
 
@@ -215,73 +216,22 @@ class MultiAgentExplorerEnv(gym.Env):
         r, c, theta = self.world.poses[agent_id]
         H, W = self.world.config.height, self.world.config.width
 
-        # 3-channel local map centered on the agent
-        local_map = self._extract_local_map(agent_id)
+        local_map = extract_local_map(
+            self.world.local_occupancy[agent_id], (r, c),
+            local_map_size=LOCAL_MAP_SIZE,
+            free_val=FREE, occupied_val=OCCUPIED, unknown_val=UNKNOWN)
 
-        # Own pose (normalized)
-        own_pose = np.array([
-            r / max(H - 1, 1) * 2 - 1,
-            c / max(W - 1, 1) * 2 - 1,
-            float(np.sin(theta)),
-            float(np.cos(theta)),
-        ], dtype=np.float32)
+        teammate_poses = [
+            self.world.poses[j] for j in range(self.n_agents) if j != agent_id
+        ]
 
-        # Teammate relative poses (read from shared map: other robot positions
-        # are sensed as visited cells, but we cheat slightly here and use the
-        # true poses for the relative-offset feature. In a real ROS system this
-        # comes from /amcl_pose topics.
-        teammates = np.zeros((N_AGENTS - 1, 4), dtype=np.float32)
-        slot = 0
-        for j in range(self.n_agents):
-            if j == agent_id:
-                continue
-            rj, cj, thetaj = self.world.poses[j]
-            teammates[slot, 0] = (rj - r) / max(H - 1, 1)
-            teammates[slot, 1] = (cj - c) / max(W - 1, 1)
-            teammates[slot, 2] = float(np.sin(thetaj - theta))
-            teammates[slot, 3] = float(np.cos(thetaj - theta))
-            slot += 1
-
-        # Frontiers in shared map
-        frontiers, n_valid = detect_frontiers(
-            self.world.shared_occupancy, (r, c), max_n=MAX_FRONTIERS)
-        return {
-            'local_map': local_map,
-            'own_pose': own_pose,
-            'teammates': teammates,
-            'frontiers': frontiers,
-            'n_frontiers': int(n_valid),
-        }
-
-    def _extract_local_map(self, agent_id: int) -> np.ndarray:
-        """Return a 3xSxS window centered on the agent, padded with UNKNOWN."""
-        S = LOCAL_MAP_SIZE
-        H, W = self.world.config.height, self.world.config.width
-        local = self.world.local_occupancy[agent_id]
-
-        r, c, _ = self.world.poses[agent_id]
-        half = S // 2
-        r0, r1 = r - half, r - half + S
-        c0, c1 = c - half, c - half + S
-
-        src_r0 = max(r0, 0)
-        src_r1 = min(r1, H)
-        src_c0 = max(c0, 0)
-        src_c1 = min(c1, W)
-
-        out = np.full((S, S), UNKNOWN, dtype=np.uint8)
-        if src_r1 > src_r0 and src_c1 > src_c0:
-            dst_r0 = src_r0 - r0
-            dst_r1 = dst_r0 + (src_r1 - src_r0)
-            dst_c0 = src_c0 - c0
-            dst_c1 = dst_c0 + (src_c1 - src_c0)
-            out[dst_r0:dst_r1, dst_c0:dst_c1] = local[src_r0:src_r1, src_c0:src_c1]
-
-        # Build 3 channels: free / obstacle / explored
-        ch_free = (out == FREE).astype(np.float32)
-        ch_obstacle = (out == OCCUPIED).astype(np.float32)
-        ch_explored = ((out == FREE) | (out == OCCUPIED)).astype(np.float32)
-        return np.stack([ch_free, ch_obstacle, ch_explored], axis=0)
+        return build_observation(
+            local_map, (r, c, theta), (H, W),
+            teammate_poses=teammate_poses,
+            shared_occupancy=self.world.shared_occupancy,
+            n_agents=self.n_agents,
+            max_frontiers=MAX_FRONTIERS,
+        )
 
     # ------------------------------------------------------------------
     # Rendering (optional)
